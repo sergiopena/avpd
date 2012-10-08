@@ -1,0 +1,100 @@
+#!/usr/bin/perl
+#
+# Abiquo VncProxy Daemon
+# Author: Sergio
+#
+# - This script gather all mapings from kinton database from hypervisor.ipService:virtualmachine
+#################################
+
+$PUBLIC_IP='192.168.1.135';
+$LOCAL_IP='192.168.1.135';
+$DATABASE_IP='192.168.1.129';
+$DATABASE_PORT='3306';
+$DATABASE_USER='avpd';
+$DATABASE_PASSWORD='password';
+$DATABASE_NAME='kinton';
+$interface='eth1';
+$netmask='/24';
+
+
+# Database query of hypervisor data
+@result=qx/mysql $DATABASE_NAME -h $DATABASE_IP -u $DATABASE_USER -p$DATABASE_PASSWORD -Bse "select h.ip, h.ipService,min(vm.vdrpPort),max(vm.vdrpPort) from hypervisor h, virtualmachine vm where vm.vdrpIP = h.ipService and vm.vdrpPort !=0 group by h.ipService;"/;
+
+#iptables -t nat -A PREROUTING -i eth0 --dst 192.168.1.149 -p udp --dport 4120 -j DNAT --to-destination 10.0.0.1:4203
+#iptables -nL
+
+# Running rules loaded on netfilter
+@runningNAT=qx/iptables-save|grep DNAT/;
+@upIfaces=qx/ip add sh dev $interface|grep inet/;
+
+# foreach db query gather information of ips and range port.
+foreach $line (@result) {
+	$line =~ /(\d*\.\d*\.\d*\.\d*)\t(\d*\.\d*\.\d*\.\d*)\t(\d*)\t(\d*)/;
+ 	$hypervisorIP = $1;
+  	$serviceIP = $2;
+  	$minPort = $3;
+  	$maxPort = $4;
+
+	# foreach hypervisor check if the address is already added to the hyperviosr
+	# if it's already running, the address is popped from the array, so all running addreses
+ 	# not present on database will be deleted after
+  	$interfaceIndex=0;
+  	$interfaceAlreadyRunning=0;
+  	foreach $runningIP ( @upIfaces ){
+		$runningIP=~ s/.*inet //;
+		chomp($runningIP);
+		$runningIP=~ s/\/.*//;
+	        print "Regext tratada .$runningIP. ---- .$serviceIP. \n";
+  		if ( $runningIP =~ /\Q$serviceIP\E/ ){
+  			splice (@upIfaces,$interfaceIndex,1);
+			print "Iface $runningIP already running\n";
+  			$interfaceAlreadyRunning=1;
+  		}
+  		$interfaceIndex++;
+  	}
+
+	# if the address is not present its added
+  	if ( $interfaceAlreadyRunning == 0 ){
+  		print "Adding interface to $serviceIP\n";
+  		qx/ip address add $serviceIP$netmask dev $interface/;
+  	}
+			  
+	for ($i=$minPort; $i<=$maxPort; $i++){
+		
+	  	$x=0; #Counter for interval port
+	  	$alreadyRunning=0; # Flag is the build rule is already loaded
+
+	  	# If built rule is loaded delete those one from runing rules
+	  	# to filter changes from database
+	  	foreach $runningLine (@runningNAT){
+	  		if ( $runningLine =~ /-d $serviceIP -p udp -m udp --dport $i -j DNAT --to-destination $hypervisorIP:$i/ ){
+	  			splice (@runningNAT,$x,1);
+	  			$alreadyRunning=1;
+	  		}
+	  		$x++;
+	  	}	
+	
+		if ( $alreadyRunning == 0 ){
+			print "[rules][add] Adding rules from IP $serviceIP=>$hypervisorIP from $minPort to $maxPort\n";
+			# Add nat entry
+		  	qx/iptables -t nat -A PREROUTING --src 0.0.0.0 --dst $serviceIP -p udp --dport $i -j DNAT --to-destination $hypervisorIP:$i/ unless ($alreadyRunning == 1);
+		  	# Add filtering entry
+		  	qx/iptables -t filter -A FORWARD --src 0.0.0.0 --dst $serviceIP -p udp --dport $i -j ACCEPT/
+		}
+	}		
+}
+
+
+foreach $runningLine (@runningNAT){
+	$runningLine =~ /-d (\d*\.\d*\.\d*\.\d*).*--dport (\d*)/;
+	print 'Deleting mapings IP '.$1.' port '.$2;
+	qx/iptables -t filter -D FORWARD -s 0.0.0.0 -d $1 -p udp --dport $2 -j ACCEPT/;
+	$runningLine =~ s/-A/-D/;
+	qx/iptables -t nat $runningLine/;
+}
+
+foreach $upIfaceLime (@upIfaces) {
+	print "[address][del] Deleting address $upIfaceLime from dev $interface\n";
+	qx/ip address delete $upIfaceLime$netmask dev $interface/;
+
+}
